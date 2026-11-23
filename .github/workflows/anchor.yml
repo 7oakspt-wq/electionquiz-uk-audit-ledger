@@ -1,0 +1,64 @@
+name: Anchor Cumulative Polling Snapshot (Bitcoin + RFC 3161)
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'   # Runs automatically every 6 hours (UTC)
+  workflow_dispatch:         # Lets you trigger a manual run anytime
+
+permissions:
+  contents: write
+
+jobs:
+  anchor-snapshot:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Audit Ledger
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install OpenTimestamps Client
+        run: pip install --quiet opentimestamps-client
+
+      - name: Fetch Live Aggregated Snapshot
+        run: |
+          mkdir -p snapshots
+          STAMP=$(date -u +"%Y-%m-%d_%H%MZ")
+          FILE="snapshots/${STAMP}.json"
+          curl -fsSL -A "ElectionQuizAuditBot/1.0" \
+            "https://electionquiz.co.uk/wp-json/eq/v1/audit-snapshot" \
+            -o "$FILE"
+          python3 -m json.tool "$FILE" > /dev/null
+          sha256sum "$FILE" > "${FILE}.sha256"
+          echo "SNAPSHOT_FILE=$FILE" >> $GITHUB_ENV
+          echo "SNAPSHOT_STAMP=$STAMP" >> $GITHUB_ENV
+
+      - name: Create DigiCert RFC 3161 + Bitcoin OpenTimestamps Proofs
+        run: |
+          # 1. Instant RFC 3161 cryptographic timestamp (DigiCert)
+          openssl ts -query -data "$SNAPSHOT_FILE" -sha256 -cert -out "${SNAPSHOT_FILE}.tsq"
+          curl -fsSL -H "Content-Type: application/timestamp-query" \
+            --data-binary @"${SNAPSHOT_FILE}.tsq" \
+            http://timestamp.digicert.com -o "${SNAPSHOT_FILE}.tsr"
+          rm -f "${SNAPSHOT_FILE}.tsq"
+
+          # 2. Anchor into the Bitcoin blockchain via OpenTimestamps
+          ots stamp "$SNAPSHOT_FILE"
+
+          # 3. Upgrade earlier pending .ots receipts once mined into Bitcoin blocks
+          for f in snapshots/*.ots; do
+            [ -e "$f" ] || continue
+            ots upgrade "$f" || true
+          done
+          rm -f snapshots/*.bak
+
+      - name: Commit Verified Snapshot and Proofs
+        run: |
+          git config user.name "ElectionQuiz Audit Bot"
+          git config user.email "info@electionquiz.co.uk"
+          git add snapshots/
+          git diff --staged --quiet || git commit -m "Verified snapshot ${SNAPSHOT_STAMP} (Bitcoin OTS + DigiCert RFC 3161)"
+          git push
